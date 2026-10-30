@@ -908,8 +908,11 @@ protected:
     std::unordered_set<int> mDequeuedSlots;
 
     #ifdef ENABLE_MTK_GED_KPI
-    pid_t mPid;
-    bool mIsSurfaceFlinger;
+    // Owner of the frames reported to MediaTek GED KPI, resolved when the
+    // producer connects with NATIVE_WINDOW_API_EGL; -1 while unknown, and
+    // nothing is reported then. Guarded by mMutex.
+    pid_t mPid = -1;
+    bool mIsSurfaceFlinger = false;
     #endif
 
     // Indicates whether this surface holds the mouse cursor, and subsequently determines whether

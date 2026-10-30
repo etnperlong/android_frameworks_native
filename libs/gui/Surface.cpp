@@ -146,8 +146,47 @@ struct GED_BRIDGE_OUT_GPU_TIMESTAMP {
     int is_ged_kpi_enabled;
 };
 
-static int doMtkGedKpi = 1;
-static int ged_fd = -1;
+// Opens /proc/ged and sends the null probe once per process; thread-safe
+// (function-local static). Returns -1 when /proc/ged cannot be opened.
+static int gedKpiFd() {
+    static const int fd = [] {
+        ALOGV("Opening ged");
+        const int ged_fd = open("/proc/ged", O_RDONLY | O_CLOEXEC);
+        ALOGV("Opening ged ret = %d", ged_fd);
+        if (ged_fd < 0) {
+            ALOGD("No /proc/ged: %s", strerror(errno));
+            return -1;
+        }
+        struct GED_BRIDGE_IN_GPU_TIMESTAMP in = {
+            .pid = 0,
+            //.ullWnd = (uint64_t)(intptr_t)this,
+                .ullWnd = 0,
+                .i32FrameID = 0,
+            .fence_fd = 0,
+            .isSF = 0,
+            .QedBuffer_length = 0,
+        };
+        struct GED_BRIDGE_OUT_GPU_TIMESTAMP out;
+        memset(&out, 0, sizeof(out));
+        memset(&in, 0, sizeof(in));
+        GED_BRIDGE_PACKAGE package = {
+            .ui32FunctionID = GED_BRIDGE_IO_GPU_TIMESTAMP,
+            .i32Size = sizeof(GED_BRIDGE_PACKAGE),
+            .pvParamIn = &in,
+            .i32InBufferSize = sizeof(in),
+            .pvParamOut = &out,
+            .i32OutBufferSize = sizeof(out),
+        };
+        int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+        ALOGD("First null timestamp ioctl returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
+        if (out.is_ged_kpi_enabled != 1) {
+            // As before, frames are still sent; GED ignores them while disabled.
+            ALOGD("is_ged_kpi_enabled reported disabled");
+        }
+        return ged_fd;
+    }();
+    return fd;
+}
 #endif
 
 Surface::ProducerDeathListenerProxy::ProducerDeathListenerProxy(
@@ -223,44 +262,7 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
     mSurfaceControlHandle = surfaceControlHandle;
 
     #ifdef ENABLE_MTK_GED_KPI
-    if (ged_fd == -1 && doMtkGedKpi == 1) {
-        ALOGV("Opening ged");
-        ged_fd = open("/proc/ged", O_RDONLY);
-        ALOGV("Opening ged ret = %d", ged_fd);
-        {
-        struct GED_BRIDGE_IN_GPU_TIMESTAMP in = {
-            .pid = 0,
-            //.ullWnd = (uint64_t)(intptr_t)this,
-                .ullWnd = 0,
-                .i32FrameID = 0,
-            .fence_fd = 0,
-            .isSF = 0,
-            .QedBuffer_length = 0,
-        };
-        struct GED_BRIDGE_OUT_GPU_TIMESTAMP out;
-        memset(&out, 0, sizeof(out));
-        memset(&in, 0, sizeof(in));
-        GED_BRIDGE_PACKAGE package = {
-            .ui32FunctionID = GED_BRIDGE_IO_GPU_TIMESTAMP,
-            .i32Size = sizeof(GED_BRIDGE_PACKAGE),
-            .pvParamIn = &in,
-            .i32InBufferSize = sizeof(in),
-            .pvParamOut = &out,
-            .i32OutBufferSize = sizeof(out),
-        };
-        if (ged_fd >= 0) {
-            int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
-            ALOGD("First null timestamp ioctl returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
-            if (out.is_ged_kpi_enabled != 1) {
-                ALOGD("is_ged_kpi_enabled reported disabled");
-                doMtkGedKpi = 0;
-            }
-        } else {
-            ALOGD("No /proc/ged: %s", strerror(errno));
-            doMtkGedKpi = 0;
-        }
-        }
-    }
+    gedKpiFd();
     #endif
 
     IGraphicBufferProducer::SurfaceConfig config;
@@ -923,7 +925,7 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
 
 
     #ifdef ENABLE_MTK_GED_KPI
-    if (mGraphicBufferProducer != nullptr && ged_fd >= 0) {
+    if (mGraphicBufferProducer != nullptr && mPid >= 0 && gedKpiFd() >= 0) {
         uint64_t uniqueId;
         mGraphicBufferProducer->getUniqueId(&uniqueId);
 
@@ -948,7 +950,7 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
             .i32OutBufferSize = sizeof(out),
         };
 
-        int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+        int ret = ioctl(gedKpiFd(), GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
         ALOGV("GPU timestamp ioctl returned %d %d %d %d", ret, out.eError, out.is_ged_kpi_enabled, in.i32FrameID);
 
         close(dupFenceFd);
@@ -1592,7 +1594,7 @@ void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
     mQueueBufferCondition.broadcast();
 
     #ifdef ENABLE_MTK_GED_KPI
-    if (mGraphicBufferProducer != nullptr && ged_fd >= 0) {
+    if (mGraphicBufferProducer != nullptr && mPid >= 0 && gedKpiFd() >= 0) {
         sp<GraphicBuffer>& gbuf(mSlots[slot].buffer);
         uint64_t uniqueId;
         mGraphicBufferProducer->getUniqueId(&uniqueId);
@@ -1618,7 +1620,7 @@ void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
                 .pvParamOut = &out,
                 .i32OutBufferSize = sizeof(out),
             };
-            int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+            int ret = ioctl(gedKpiFd(), GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
             ALOGV("GPU timestamp ioctl returned %d %d %d", ret, out.eError, in.i32FrameID);
         }
         // acquire
@@ -1641,7 +1643,7 @@ void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
                 .pvParamOut = &out,
                 .i32OutBufferSize = sizeof(out),
             };
-            int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+            int ret = ioctl(gedKpiFd(), GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
             ALOGV("GPU timestamp ioctl returned %d %d %d", ret, out.eError, in.i32FrameID);
         }
         close(dupFenceFd);
@@ -2562,7 +2564,7 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
     #ifdef ENABLE_MTK_GED_KPI
     // For MTK GED KPI, we need to grab the Surface owner's PID
     // and also know whether that owner is surfaceflinger
-    if (api == NATIVE_WINDOW_API_EGL && ged_fd >= 0) {
+    if (err == NO_ERROR && api == NATIVE_WINDOW_API_EGL && gedKpiFd() >= 0) {
         IPCThreadState *ipc = IPCThreadState::selfOrNull();
         const sp<IBinder>& token = IInterface::asBinder(mGraphicBufferProducer);
         mPid =  (token != NULL && NULL != token->localBinder())
@@ -2643,6 +2645,10 @@ int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
     mReqUsage = 0;
     mCrop.clear();
     mDataSpace = Dataspace::UNKNOWN;
+    #ifdef ENABLE_MTK_GED_KPI
+    mPid = -1;
+    mIsSurfaceFlinger = false;
+    #endif
     mScalingMode = NATIVE_WINDOW_SCALING_MODE_FREEZE;
     mTransform = 0;
     mStickyTransform = 0;
